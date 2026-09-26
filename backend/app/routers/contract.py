@@ -41,10 +41,16 @@ def get_entry(entry_id: int) -> dict:
 
 @router.post("", response_model=ActionResult)
 def create_entry(payload: EntryPayload) -> ActionResult:
-    """登记一条委托检验合同，缺字段时说明原因而不是静默丢弃。"""
-    entry, missing = service.create_entry(payload.values)
+    """登记一条委托检验合同；同一合同编号重复提交时合并进原记录，不再累积新条目。"""
+    entry, missing, created = service.create_entry(payload.values)
     if missing:
         return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
+    if not created:
+        return ActionResult(
+            ok=True,
+            message=f"合同编号 {entry.get('合同编号')} 的委托检验合同已存在，本次提交已合并到原记录，未重复登记",
+            entry=entry,
+        )
     return ActionResult(ok=True, message="委托检验合同已登记", entry=entry)
 
 
