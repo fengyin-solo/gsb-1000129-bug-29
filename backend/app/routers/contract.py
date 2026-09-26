@@ -4,9 +4,10 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 from app.schemas import ActionResult, EntryPayload, PageResult
-from app.services.contract import ContractService
+from app.services.contract import ConflictError, ContractService
 
 router = APIRouter(prefix="/api/contract", tags=["委托合同"])
 
@@ -30,9 +31,20 @@ def list_entries(
     return PageResult(items=items, total=total, page=page, size=size)
 
 
+@router.get("/export")
+def export_entries() -> dict[str, Any]:
+    """导出委托合同清单：返回当前过滤条件下的全量数据。"""
+    items, total = service.list_entries(page=1, size=10000)
+    return {"module": "contract", "total": total, "items": items}
+
+
 @router.get("/{entry_id}", response_model=dict)
 def get_entry(entry_id: int) -> dict:
-    """读取单条委托检验合同明细；不存在时给出可读的错误说明。"""
+    """读取单条委托检验合同明细；不存在时给出可读的错误说明。
+
+    明细与列表都直接返回 store 里的同一条 entry，处理结果字段天然同源，
+    不会出现列表是新结果、详情还是旧提示的错位。
+    """
     entry = service.get_entry(entry_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"委托检验合同 {entry_id} 不存在或已归档")
@@ -58,8 +70,31 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     return ActionResult(ok=True, message=message, entry=entry)
 
 
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出委托合同清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "contract", "total": total, "items": items}
+@router.post("/{entry_id}/result", response_model=ActionResult)
+def submit_result(entry_id: int, payload: EntryPayload) -> ActionResult | JSONResponse:
+    """提交单份委托检验合同的处理结果。
+
+    - 同一来源（clientToken）重复提交按幂等返回首次结果，不新增、不累积；
+    - 携带的 revision 落后时返回 409，并同时给出「提交依据的旧结果」与「服务器最新结果」
+      供比对；调用方确认后用 values.force=true 一次性覆盖，仅保留一份有效结果。
+    """
+    force = bool(payload.values.get("force", False))
+    try:
+        entry, message, outcome = service.submit_result(entry_id, payload.values, force=force)
+    except ConflictError as conflict:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "conflict": True,
+                "message": conflict.message,
+                "serverRevision": conflict.server_revision,
+                # 冲突「前」：本次提交想写入、但版本已过期的那条结果。
+                "submitted": conflict.submitted,
+                # 冲突「后」：服务器上已经生效的那条结果。
+                "current": conflict.current,
+            },
+        )
+    if entry is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=entry)
